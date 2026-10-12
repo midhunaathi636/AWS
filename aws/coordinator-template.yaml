@@ -1,0 +1,349 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Persistent Flower SuperLink and remote experiment queue in the coordinator account.
+
+Parameters:
+  VpcId: { Type: 'AWS::EC2::VPC::Id' }
+  PrivateSubnetA: { Type: 'AWS::EC2::Subnet::Id' }
+  PrivateSubnetB: { Type: 'AWS::EC2::Subnet::Id' }
+  PrivateHostedZoneId: { Type: String }
+  ControlOperatorSecurityGroupId:
+    Type: 'AWS::EC2::SecurityGroup::Id'
+    Description: Security group of an approved SSM/bastion host used to register SuperNode public keys.
+  ControlDnsName:
+    Type: String
+    Description: Private DNS name covered by the TLS certificate for Flower Control API.
+  FleetPrivateDnsName:
+    Type: String
+    Description: Verified private DNS name covered by the TLS certificate for Flower Fleet API.
+  CoordinatorImage:
+    Type: String
+    Description: ECR image built from production_fl/Dockerfile.coordinator.
+  ModelBucketName: { Type: String }
+  ModelBucketArn: { Type: String }
+  DatabaseProxyEndpoint: { Type: String }
+  DatabaseName: { Type: String }
+  DatabaseSecretArn: { Type: String }
+  DatabaseProxySecurityGroupId: { Type: 'AWS::EC2::SecurityGroup::Id' }
+  TlsBundleSecretArn:
+    Type: String
+    Description: Secrets Manager JSON containing ca, cert, key PEM strings.
+  ControlCaSecretArn:
+    Type: String
+    Description: Secrets Manager string containing the CA PEM certificate.
+  OrganizationAccountA: { Type: String, AllowedPattern: '[0-9]{12}' }
+  OrganizationAccountB: { Type: String, AllowedPattern: '[0-9]{12}' }
+  OrganizationAccountC: { Type: String, AllowedPattern: '[0-9]{12}' }
+
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings: [{ Name: containerInsights, Value: enabled }]
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy]
+  SuperLinkRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FlowerAggregateOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref TlsBundleSecretArn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${ModelBucketArn}/public-schemas/*'
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${ModelBucketArn}/secure-aggregates/*'
+              - Effect: Allow
+                Action: [elasticfilesystem:ClientMount, elasticfilesystem:ClientWrite]
+                Resource: !GetAtt StateFileSystem.Arn
+                Condition:
+                  StringEquals: { 'elasticfilesystem:AccessPointArn': !GetAtt StateAccessPoint.Arn }
+  DaemonRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CoordinatorOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref DatabaseSecretArn, !Ref ControlCaSecretArn]
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${OrganizationAccountA}:function:*'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${OrganizationAccountB}:function:*'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${OrganizationAccountC}:function:*'
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${ModelBucketArn}/secure-aggregates/*'
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: [!Sub '${ModelBucketArn}/models/*', !Sub '${ModelBucketArn}/reports/*']
+  SuperLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Flower APIs from their separate internal load balancers
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 9092, ToPort: 9092, SourceSecurityGroupId: !Ref FleetLoadBalancerSecurityGroup }
+        - { IpProtocol: tcp, FromPort: 8000, ToPort: 8000, SourceSecurityGroupId: !Ref ControlLoadBalancerSecurityGroup }
+  DaemonSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Outbound coordinator queue runner
+      VpcId: !Ref VpcId
+  ProxyFromDaemon:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseProxySecurityGroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref DaemonSecurityGroup
+  FleetLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal PrivateLink Fleet API
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 9092, ToPort: 9092, CidrIp: 0.0.0.0/0 }
+  ControlLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal Control API for coordinator task only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8000, ToPort: 8000, SourceSecurityGroupId: !Ref DaemonSecurityGroup }
+        - { IpProtocol: tcp, FromPort: 8000, ToPort: 8000, SourceSecurityGroupId: !Ref ControlOperatorSecurityGroupId }
+  StateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Flower state EFS access from SuperLink
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 2049, ToPort: 2049, SourceSecurityGroupId: !Ref SuperLinkSecurityGroup }
+  StateFileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      BackupPolicy: { Status: ENABLED }
+  StateAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref StateFileSystem
+      PosixUser: { Uid: '1000', Gid: '1000' }
+      RootDirectory:
+        Path: /flower-state
+        CreationInfo: { OwnerUid: '1000', OwnerGid: '1000', Permissions: '700' }
+  StateMountA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref StateFileSystem
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroups: [!Ref StateSecurityGroup]
+  StateMountB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref StateFileSystem
+      SubnetId: !Ref PrivateSubnetB
+      SecurityGroups: [!Ref StateSecurityGroup]
+  FleetLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internal
+      Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroups: [!Ref FleetLoadBalancerSecurityGroup]
+  FleetTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: 9092
+      TargetType: ip
+      HealthCheckProtocol: TCP
+  FleetListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref FleetLoadBalancer
+      Protocol: TCP
+      Port: 9092
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref FleetTargetGroup }]
+  FleetEndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    Properties:
+      AcceptanceRequired: true
+      NetworkLoadBalancerArns: [!Ref FleetLoadBalancer]
+      PrivateDnsName: !Ref FleetPrivateDnsName
+  FleetEndpointPermissions:
+    Type: AWS::EC2::VPCEndpointServicePermissions
+    Properties:
+      ServiceId: !Ref FleetEndpointService
+      AllowedPrincipals:
+        - !Sub 'arn:${AWS::Partition}:iam::${OrganizationAccountA}:root'
+        - !Sub 'arn:${AWS::Partition}:iam::${OrganizationAccountB}:root'
+        - !Sub 'arn:${AWS::Partition}:iam::${OrganizationAccountC}:root'
+  ControlLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internal
+      Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroups: [!Ref ControlLoadBalancerSecurityGroup]
+  ControlTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: 8000
+      TargetType: ip
+      HealthCheckProtocol: TCP
+  ControlListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ControlLoadBalancer
+      Protocol: TCP
+      Port: 8000
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref ControlTargetGroup }]
+  ControlRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZoneId
+      Name: !Ref ControlDnsName
+      Type: CNAME
+      TTL: '60'
+      ResourceRecords: [!GetAtt ControlLoadBalancer.DNSName]
+  SuperLinkLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { RetentionInDays: 30 }
+  DaemonLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { RetentionInDays: 30 }
+  SuperLinkTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: secure-platform-superlink
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '1024'
+      Memory: '2048'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt SuperLinkRole.Arn
+      Volumes:
+        - Name: state
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref StateFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig: { AccessPointId: !Ref StateAccessPoint, IAM: ENABLED }
+      ContainerDefinitions:
+        - Name: superlink
+          Image: !Ref CoordinatorImage
+          Essential: true
+          EntryPoint: [python, -m, production_fl.superlink]
+          Environment:
+            - { Name: FL_SUPERLINK_TLS_SECRET_ARN, Value: !Ref TlsBundleSecretArn }
+            - { Name: FL_MODEL_BUCKET, Value: !Ref ModelBucketName }
+            - { Name: FL_SUPERLINK_DATABASE, Value: /state/state.db }
+          MountPoints: [{ SourceVolume: state, ContainerPath: /state, ReadOnly: false }]
+          PortMappings:
+            - { ContainerPort: 8000, Protocol: tcp }
+            - { ContainerPort: 9092, Protocol: tcp }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref SuperLinkLogs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: flower
+  SuperLinkService:
+    Type: AWS::ECS::Service
+    DependsOn: [StateMountA, StateMountB, FleetListener, ControlListener]
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: 1
+      DeploymentConfiguration: { MinimumHealthyPercent: 0, MaximumPercent: 100 }
+      TaskDefinition: !Ref SuperLinkTask
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref SuperLinkSecurityGroup]
+      LoadBalancers:
+        - { ContainerName: superlink, ContainerPort: 9092, TargetGroupArn: !Ref FleetTargetGroup }
+        - { ContainerName: superlink, ContainerPort: 8000, TargetGroupArn: !Ref ControlTargetGroup }
+  DaemonTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: secure-platform-fl-queue
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '1024'
+      Memory: '2048'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt DaemonRole.Arn
+      ContainerDefinitions:
+        - Name: daemon
+          Image: !Ref CoordinatorImage
+          Essential: true
+          Environment:
+            - { Name: AWS_RDS_SECRET_ARN, Value: !Ref DatabaseSecretArn }
+            - { Name: AWS_RDS_PROXY_ENDPOINT, Value: !Ref DatabaseProxyEndpoint }
+            - { Name: AWS_RDS_DATABASE, Value: !Ref DatabaseName }
+            - { Name: FL_CONTROL_CA_SECRET_ARN, Value: !Ref ControlCaSecretArn }
+            - { Name: FL_SUPERLINK_CONTROL_ADDRESS, Value: !Sub '${ControlDnsName}:8000' }
+            - { Name: FL_MODEL_BUCKET, Value: !Ref ModelBucketName }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref DaemonLogs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: queue
+  DaemonService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: 1
+      DeploymentConfiguration: { MinimumHealthyPercent: 0, MaximumPercent: 100 }
+      TaskDefinition: !Ref DaemonTask
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref DaemonSecurityGroup]
+
+Outputs:
+  CoordinatorRoleArn: { Value: !GetAtt DaemonRole.Arn }
+  FleetEndpointServiceName: { Value: !Sub 'com.amazonaws.vpce.${AWS::Region}.${FleetEndpointService}' }
+  FleetPrivateDnsName: { Value: !Ref FleetPrivateDnsName }
+  ControlAddress: { Value: !Sub '${ControlDnsName}:8000' }
+  FlowerStateFileSystemId: { Value: !Ref StateFileSystem }
