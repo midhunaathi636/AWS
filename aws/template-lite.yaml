@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Auto-deploy lite stack for Secure Collaborative Learning Platform.
+  No VPC and no API Gateway. Lambda Function URL + S3 + Cognito + SQLite (demo seed).
+  Suitable for push-to-deploy demos. For production RDS/EFS use aws/template.yaml.
+
+Parameters:
+  WebOrigin:
+    Type: String
+    Default: '*'
+    Description: Frontend origin(s), comma-separated Amplify URLs, or * for first deploy
+  ProjectName:
+    Type: String
+    Default: sclp
+  AllowDemoSeed:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [x86_64]
+    Timeout: 60
+    MemorySize: 1024
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ModelBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-users'
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  CognitoAppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-web'
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  FileEncryptionSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/file-encryption-key'
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: secret
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  SessionSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/session-secret'
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: secret
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  PlatformApiFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub '${ProjectName}-api'
+      CodeUri: ../
+      Handler: aws/lambda-handler.handler
+      Description: Secure Collaborative Learning Platform API (Lambda Function URL, no API Gateway)
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins:
+            - !Ref WebOrigin
+          AllowHeaders:
+            - authorization
+            - content-type
+            - cookie
+          AllowMethods:
+            - GET
+            - POST
+            - PUT
+            - PATCH
+            - DELETE
+            - HEAD
+          AllowCredentials: true
+          MaxAge: 86400
+      Environment:
+        Variables:
+          NODE_ENV: production
+          ALLOW_DEMO_SEED: !Ref AllowDemoSeed
+          API_PORT: '4000'
+          FRONTEND_ORIGIN: !Ref WebOrigin
+          DATA_DIR: /tmp/platform-data
+          DB_PATH: /tmp/platform-data/secure-platform.sqlite
+          MAX_UPLOAD_BYTES: '8000000'
+          FILE_ENCRYPTION_KEY: !Sub '{{resolve:secretsmanager:${FileEncryptionSecret}:SecretString:secret}}'
+          SESSION_SECRET: !Sub '{{resolve:secretsmanager:${SessionSecret}:SecretString:secret}}'
+          AWS_S3_DATA_BUCKET: !Ref DataBucket
+          AWS_S3_MODEL_BUCKET: !Ref ModelBucket
+          AWS_S3_BACKUP_BUCKET: !Ref BackupBucket
+          AWS_CLOUDWATCH_METRICS: 'false'
+          PYTHON_BIN: python3
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref DataBucket
+        - S3CrudPolicy:
+            BucketName: !Ref ModelBucket
+        - S3CrudPolicy:
+            BucketName: !Ref BackupBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Ref FileEncryptionSecret
+                - !Ref SessionSecret
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: '*'
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PlatformApiFunction}'
+      RetentionInDays: 14
+
+Outputs:
+  ApiEndpoint:
+    Description: Lambda Function URL — set Amplify VITE_API_URL to this value (no trailing slash)
+    Value: !GetAtt PlatformApiFunctionUrl.FunctionUrl
+  ApiUrl:
+    Description: Alias for ApiEndpoint
+    Value: !GetAtt PlatformApiFunctionUrl.FunctionUrl
+  CognitoUserPoolId:
+    Value: !Ref CognitoUserPool
+  CognitoClientId:
+    Value: !Ref CognitoAppClient
+  DataBucketName:
+    Value: !Ref DataBucket
+  ModelBucketName:
+    Value: !Ref ModelBucket
+  BackupBucketName:
+    Value: !Ref BackupBucket
+  Region:
+    Value: !Ref AWS::Region

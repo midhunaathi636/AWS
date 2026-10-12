@@ -1,0 +1,429 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Secure Collaborative Learning Platform API stack (API Gateway, Lambda, PostgreSQL through RDS Proxy, S3, Cognito, CloudWatch).
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC for Lambda, EFS mount targets, and RDS.
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet::Id
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet::Id
+  WebOrigin:
+    Type: String
+    Default: https://localhost
+    Description: Exact frontend origin allowed by API Gateway and Express CORS.
+  DatabaseName:
+    Type: String
+    Default: secureplatform
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9_]{0,62}'
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  DatabaseMultiAz:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+  SageMakerTrainingImage:
+    Type: String
+    Default: ''
+    Description: Optional ECR image URI implementing SageMaker's training-toolkit contract.
+  OrganizationLaunchersJson:
+    Type: String
+    Default: '{}'
+    Description: JSON map of approved organization IDs to launcher Lambda ARNs.
+
+Conditions:
+  UseMultiAzDatabase: !Equals [!Ref DatabaseMultiAz, 'true']
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [x86_64]
+    Timeout: 900
+    MemorySize: 2048
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: aws:kms }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+  ModelBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: aws:kms }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: aws:kms }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Platform Lambda egress and EFS/RDS client identity
+      VpcId: !Ref VpcId
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NFS access from platform Lambda only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL access from RDS Proxy only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ProxySecurityGroup
+  ProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS Proxy access from platform Lambda only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  PlatformFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+  PlatformAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref PlatformFileSystem
+      PosixUser: { Uid: '1000', Gid: '1000' }
+      RootDirectory:
+        Path: /secure-platform
+        CreationInfo: { OwnerUid: '1000', OwnerGid: '1000', Permissions: '750' }
+  EfsMountA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref PlatformFileSystem
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroups: [!Ref EfsSecurityGroup]
+  EfsMountB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref PlatformFileSystem
+      SubnetId: !Ref PrivateSubnetB
+      SecurityGroups: [!Ref EfsSecurityGroup]
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for platform backup catalog
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      AllocatedStorage: '20'
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+      StorageEncrypted: true
+      ManageMasterUserPassword: true
+      MasterUsername: platform_admin
+      DBName: !Ref DatabaseName
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]
+      PubliclyAccessible: false
+      MultiAZ: !If [UseMultiAzDatabase, true, false]
+      BackupRetentionPeriod: 7
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: true
+
+  DatabaseProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: rds.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadDatabaseCredentials
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+  DatabaseProxy:
+    Type: AWS::RDS::DBProxy
+    Properties:
+      DBProxyName: secure-platform-proxy
+      EngineFamily: POSTGRESQL
+      RequireTLS: true
+      RoleArn: !GetAtt DatabaseProxyRole.Arn
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !GetAtt Database.MasterUserSecret.SecretArn
+          IAMAuth: DISABLED
+      VpcSubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      VpcSecurityGroupIds: [!Ref ProxySecurityGroup]
+  DatabaseProxyTargets:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName: !Ref DatabaseProxy
+      TargetGroupName: default
+      DBInstanceIdentifiers: [!Ref Database]
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: SecureCollaborativeLearningUsers
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+  CognitoAppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientName: secure-platform-web
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      RefreshTokenValidity: 30
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits:
+        RefreshToken: days
+        AccessToken: minutes
+        IdToken: minutes
+
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sagemaker.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PlatformTrainingDataAndLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource: [!GetAtt DataBucket.Arn, !Sub '${DataBucket.Arn}/*']
+              - Effect: Allow
+                Action: [s3:PutObject, s3:AbortMultipartUpload]
+                Resource: !Sub '${ModelBucket.Arn}/*'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: '*'
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+
+  PlatformExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: PlatformAwsIntegrations
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource: [!GetAtt DataBucket.Arn, !Sub '${DataBucket.Arn}/*', !GetAtt ModelBucket.Arn, !Sub '${ModelBucket.Arn}/*', !GetAtt BackupBucket.Arn, !Sub '${BackupBucket.Arn}/*']
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+              - Effect: Allow
+                Action: [cognito-idp:InitiateAuth, cognito-idp:RespondToAuthChallenge]
+                Resource: !GetAtt CognitoUserPool.Arn
+              - Effect: Allow
+                Action: [sagemaker:CreateTrainingJob, sagemaker:DescribeTrainingJob]
+                Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt SageMakerExecutionRole.Arn
+                Condition:
+                  StringEquals: { iam:PassedToService: sagemaker.amazonaws.com }
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action: [elasticfilesystem:ClientMount, elasticfilesystem:ClientWrite]
+                Resource: !GetAtt PlatformFileSystem.Arn
+                Condition:
+                  StringEquals: { 'elasticfilesystem:AccessPointArn': !GetAtt PlatformAccessPoint.Arn }
+
+  PlatformApiFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: [EfsMountA, EfsMountB]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: ../
+      Handler: aws/lambda-handler.handler
+      Role: !GetAtt PlatformExecutionRole.Arn
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: [!Ref WebOrigin]
+          AllowHeaders: [authorization, content-type, cookie]
+          AllowMethods: [GET, POST, PUT, PATCH, DELETE, HEAD]
+          AllowCredentials: true
+          MaxAge: 86400
+      FileSystemConfigs:
+        - Arn: !GetAtt PlatformAccessPoint.Arn
+          LocalMountPath: /mnt/platform
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+      Environment:
+        Variables:
+          NODE_ENV: production
+          API_PORT: '4000'
+          FRONTEND_ORIGIN: !Ref WebOrigin
+          DATA_DIR: /mnt/platform
+          DB_PATH: /mnt/platform/secure-platform.sqlite
+          MAX_UPLOAD_BYTES: '8000000'
+          FILE_ENCRYPTION_KEY: !Sub '{{resolve:secretsmanager:${FileEncryptionSecret}:SecretString:secret}}'
+          SESSION_SECRET: !Sub '{{resolve:secretsmanager:${SessionSecret}:SecretString:secret}}'
+          AWS_REGION: !Ref AWS::Region
+          AWS_S3_DATA_BUCKET: !Ref DataBucket
+          AWS_S3_MODEL_BUCKET: !Ref ModelBucket
+          AWS_S3_BACKUP_BUCKET: !Ref BackupBucket
+          AWS_RDS_SECRET_ARN: !GetAtt Database.MasterUserSecret.SecretArn
+          AWS_RDS_PROXY_ENDPOINT: !GetAtt DatabaseProxy.Endpoint
+          AWS_RDS_DATABASE: !Ref DatabaseName
+          AWS_COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+          AWS_COGNITO_CLIENT_ID: !Ref CognitoAppClient
+          AWS_SAGEMAKER_ROLE_ARN: !GetAtt SageMakerExecutionRole.Arn
+          AWS_SAGEMAKER_TRAINING_IMAGE: !Ref SageMakerTrainingImage
+          AWS_SAGEMAKER_INSTANCE_TYPE: ml.m5.large
+          AWS_CLOUDWATCH_NAMESPACE: SecureCollaborativeLearning/Training
+          FL_ORGANIZATION_LAUNCHERS_JSON: !Ref OrganizationLaunchersJson
+          PYTHON_BIN: python3
+  FileEncryptionSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: secret
+        PasswordLength: 64
+        ExcludePunctuation: true
+  SessionSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: secret
+        PasswordLength: 64
+        ExcludePunctuation: true
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PlatformApiFunction}'
+      RetentionInDays: 30
+  ApiErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Platform API Lambda errors exceed five in five minutes.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PlatformApiFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiEndpoint:
+    Description: Lambda Function URL (no API Gateway). Set VITE_API_URL to this value.
+    Value: !GetAtt PlatformApiFunctionUrl.FunctionUrl
+  DataBucketName: { Value: !Ref DataBucket }
+  ModelBucketName: { Value: !Ref ModelBucket }
+  ModelBucketArn: { Value: !GetAtt ModelBucket.Arn }
+  BackupBucketName: { Value: !Ref BackupBucket }
+  CognitoUserPoolId: { Value: !Ref CognitoUserPool }
+  CognitoClientId: { Value: !Ref CognitoAppClient }
+  RdsEndpoint: { Value: !GetAtt Database.Endpoint.Address }
+  RdsProxyEndpoint: { Value: !GetAtt DatabaseProxy.Endpoint }
+  RdsProxySecurityGroupId: { Value: !Ref ProxySecurityGroup }
+  DatabaseSecretArn: { Value: !GetAtt Database.MasterUserSecret.SecretArn }
+  DatabaseName: { Value: !Ref DatabaseName }
+  EfsFileSystemId: { Value: !Ref PlatformFileSystem }
