@@ -55,7 +55,11 @@ export const LoginView: React.FC = () => {
       }
       await authenticate(email, password);
     } catch (reason) {
+<<<<<<< HEAD
       setError(reason instanceof ApiError ? reason.message : (reason instanceof Error ? reason.message : 'Unable to sign in. Check that the API is reachable.'));
+=======
+      setError(reason instanceof ApiError ? reason.message : 'Unable to sign in.');
+>>>>>>> 514487f1417facee680f6075cc0a134e4bea40df
     } finally {
       setIsLoading(false);
     }
@@ -74,7 +78,11 @@ export const LoginView: React.FC = () => {
     try {
       await authenticate(userEmail, 'Demo@123', { challengeToken: undefined, otp: undefined });
     } catch (reason) {
+<<<<<<< HEAD
       setError(reason instanceof ApiError ? reason.message : (reason instanceof Error ? reason.message : 'Unable to sign in. Check that the API is reachable.'));
+=======
+      setError(reason instanceof ApiError ? reason.message : 'Unable to sign in.');
+>>>>>>> 514487f1417facee680f6075cc0a134e4bea40df
     } finally {
       setIsLoading(false);
     }

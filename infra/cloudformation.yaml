@@ -1,0 +1,355 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Secure Collaborative Learning Platform - Free-tier stack
+  (Cognito, DynamoDB, API Gateway HTTP API, Lambda, S3)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: sclp
+  WebOrigin:
+    Type: String
+    Default: https://main.d22xvq956m9ny4.amplifyapp.com
+    Description: Amplify frontend origin for CORS
+
+Resources:
+  # ---------- Cognito ----------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-users'
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: name
+          Required: false
+          Mutable: true
+        - Name: custom:role
+          AttributeDataType: String
+          Mutable: true
+        - Name: custom:orgId
+          AttributeDataType: String
+          Mutable: true
+        - Name: custom:orgName
+          AttributeDataType: String
+          Mutable: true
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-web'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+      SupportedIdentityProviders: [COGNITO]
+      AllowedOAuthFlowsUserPoolClient: false
+
+  # ---------- DynamoDB ----------
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-users'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  OrganizationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-organizations'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  DatasetsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-datasets'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: organizationId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: org-index
+          KeySchema:
+            - AttributeName: organizationId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  SharesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-shares'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  AuditLogsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-audit-logs'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: created-index
+          KeySchema:
+            - AttributeName: createdAt
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  NotificationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-notifications'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  ExperimentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-experiments'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  # ---------- S3 ----------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, HEAD]
+            AllowedOrigins: [!Ref WebOrigin]
+            MaxAge: 3000
+
+  # ---------- Lambda role ----------
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt UsersTable.Arn
+                  - !Sub '${UsersTable.Arn}/index/*'
+                  - !GetAtt OrganizationsTable.Arn
+                  - !GetAtt DatasetsTable.Arn
+                  - !Sub '${DatasetsTable.Arn}/index/*'
+                  - !GetAtt SharesTable.Arn
+                  - !GetAtt AuditLogsTable.Arn
+                  - !Sub '${AuditLogsTable.Arn}/index/*'
+                  - !GetAtt NotificationsTable.Arn
+                  - !Sub '${NotificationsTable.Arn}/index/*'
+                  - !GetAtt ExperimentsTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:ListUsers
+                Resource: !GetAtt UserPool.Arn
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-api'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 29
+      MemorySize: 512
+      Environment:
+        Variables:
+          USERS_TABLE: !Ref UsersTable
+          ORGS_TABLE: !Ref OrganizationsTable
+          DATASETS_TABLE: !Ref DatasetsTable
+          SHARES_TABLE: !Ref SharesTable
+          AUDIT_TABLE: !Ref AuditLogsTable
+          NOTIFICATIONS_TABLE: !Ref NotificationsTable
+          EXPERIMENTS_TABLE: !Ref ExperimentsTable
+          DATA_BUCKET: !Ref DataBucket
+          USER_POOL_ID: !Ref UserPool
+          USER_POOL_CLIENT_ID: !Ref UserPoolClient
+          WEB_ORIGIN: !Ref WebOrigin
+          AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
+      Code:
+        ZipFile: |
+          // Placeholder - replaced by scripts/deploy-api.sh with real handler
+          exports.handler = async () => ({ statusCode: 200, body: '{"ok":true}' });
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-http-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref WebOrigin
+          - http://localhost:3000
+        AllowMethods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+        AllowHeaders: [Content-Type, Authorization]
+        AllowCredentials: true
+        MaxAge: 300
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiFunction.Arn}/invocations'
+      PayloadFormatVersion: '2.0'
+
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'ANY /{proxy+}'
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ApiRouteRoot:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'ANY /'
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+Outputs:
+  ApiUrl:
+    Description: HTTP API endpoint (set as VITE_API_URL in Amplify)
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Cognito App Client ID
+    Value: !Ref UserPoolClient
+  Region:
+    Value: !Ref AWS::Region
+  DataBucketName:
+    Value: !Ref DataBucket
+  UsersTableName:
+    Value: !Ref UsersTable
+  OrgsTableName:
+    Value: !Ref OrganizationsTable

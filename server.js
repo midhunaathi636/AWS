@@ -214,6 +214,7 @@ if (process.env.NODE_ENV === 'production' && process.env.ALLOW_DEMO_SEED !== 'tr
 db.prepare('INSERT OR IGNORE INTO fl_state (id, payload_json) VALUES (1, ?)').run(JSON.stringify({ currentRound: 0, totalRounds: 5, isTraining: false, isPaused: false, status: 'Idle', globalAccuracy: 0, logs: [], clientNodes: [] }));
 
 const app = express();
+<<<<<<< HEAD
 const allowedOrigins = String(FRONTEND_ORIGIN)
   .split(',')
   .map((origin) => origin.trim())
@@ -240,6 +241,9 @@ const sessionCookieOptions = () => ({
   secure: isCrossSiteFrontend || process.env.NODE_ENV === 'production',
   maxAge: typeof SESSION_TTL_MS !== 'undefined' ? SESSION_TTL_MS : 8 * 60 * 60 * 1000,
 });
+=======
+app.use(cors({ origin: FRONTEND_ORIGIN, credentials: true }));
+>>>>>>> 514487f1417facee680f6075cc0a134e4bea40df
 app.use(express.json({ limit: '2mb' }));
 const upload = multer({ dest: path.join(DATA_DIR, 'tmp'), limits: { fileSize: Number(process.env.MAX_UPLOAD_BYTES || 500 * 1024 * 1024) } });
 
@@ -379,7 +383,16 @@ const issueSession = (req, res, user) => {
   db.prepare(`UPDATE users SET last_login = ? WHERE id = ?`).run(nowIso(), user.id);
   req.user = user;
   audit(req, 'Login', 'Success', 'Authenticated user session created');
+<<<<<<< HEAD
   res.cookie('sc_session', rawToken, sessionCookieOptions());
+=======
+  res.cookie('sc_session', rawToken, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: SESSION_TTL_MS,
+  });
+>>>>>>> 514487f1417facee680f6075cc0a134e4bea40df
   res.json({ user: publicUser({ ...user, last_login: nowIso() }) });
 };
 
@@ -617,7 +630,11 @@ app.post('/api/auth/logout', requireAuth, (req, res) => {
   const rawToken = req.headers.cookie?.match(/sc_session=([^;]+)/)?.[1];
   db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(signSession(rawToken));
   audit(req, 'Logout', 'Success', 'Authenticated user session closed');
+<<<<<<< HEAD
   res.clearCookie('sc_session', sessionCookieOptions());
+=======
+  res.clearCookie('sc_session');
+>>>>>>> 514487f1417facee680f6075cc0a134e4bea40df
   res.json({ ok: true });
 });
 

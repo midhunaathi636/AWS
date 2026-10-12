@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 /**
  * API base URL resolution
  * - Local dev: defaults to http://localhost:4000 when VITE_API_URL is unset
@@ -7,6 +8,9 @@
 const configuredApiUrl = String(import.meta.env.VITE_API_URL || '').trim();
 const isProdBuild = import.meta.env.PROD === true;
 const API_BASE = (configuredApiUrl || (isProdBuild ? '' : 'http://localhost:4000')).replace(/\/$/, '');
+=======
+const API_BASE = (import.meta.env.VITE_API_URL || 'http://localhost:4000').replace(/\/$/, '');
+>>>>>>> 514487f1417facee680f6075cc0a134e4bea40df
 
 export class ApiError extends Error {
   status: number;
@@ -17,6 +21,7 @@ export class ApiError extends Error {
   }
 }
 
+<<<<<<< HEAD
 export function getApiBase(): string {
   return API_BASE;
 }
@@ -51,6 +56,17 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     throw new ApiError(hint, 0);
   }
 
+=======
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    credentials: 'include',
+    ...options,
+    headers: {
+      ...(options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
+      ...(options.headers || {})
+    }
+  });
+>>>>>>> 514487f1417facee680f6075cc0a134e4bea40df
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new ApiError(body.error || 'Request failed', response.status);
   return body as T;
