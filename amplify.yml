@@ -3,6 +3,7 @@ frontend:
   phases:
     preBuild:
       commands:
+<<<<<<< HEAD
         - |
           if [ -f package-lock.json ]; then
             npm ci --legacy-peer-deps
@@ -20,6 +21,19 @@ frontend:
           ENVEOF
         - npm run build
         - test -f dist/index.html || (echo "ERROR: dist/index.html missing" && exit 1)
+=======
+        - npm ci --legacy-peer-deps
+    build:
+      commands:
+        - |
+          cat > .env.production << EOF
+          VITE_API_URL=${VITE_API_URL:-}
+          VITE_COGNITO_USER_POOL_ID=${VITE_COGNITO_USER_POOL_ID:-}
+          VITE_COGNITO_CLIENT_ID=${VITE_COGNITO_CLIENT_ID:-}
+          VITE_AWS_REGION=${VITE_AWS_REGION:-ap-south-1}
+          EOF
+        - npm run build
+>>>>>>> 8d9d8f65e7ee8820c7f761724c46793848afe9a1
   artifacts:
     baseDirectory: dist
     files:
