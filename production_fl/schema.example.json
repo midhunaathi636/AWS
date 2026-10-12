@@ -1,0 +1,9 @@
+{
+  "patient_id": "patient_id",
+  "target": "label",
+  "labels": ["no", "yes"],
+  "features": [
+    { "name": "age", "type": "numeric", "min": 0, "max": 120 },
+    { "name": "site", "type": "categorical", "values": ["A", "B", "other"] }
+  ]
+}

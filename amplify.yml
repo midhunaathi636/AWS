@@ -1,0 +1,27 @@
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - npm ci --legacy-peer-deps
+    build:
+      commands:
+        - |
+          if [ -z "${VITE_API_URL}" ]; then
+            echo "WARNING: VITE_API_URL is empty. Login will fail until you set it."
+            echo "Deploy API with ./scripts/deploy-all.sh or GitHub Actions, then set Amplify env VITE_API_URL."
+          else
+            echo "Building with VITE_API_URL=${VITE_API_URL}"
+          fi
+        - echo "VITE_API_URL=${VITE_API_URL:-}" > .env.production
+        - echo "VITE_COGNITO_USER_POOL_ID=${VITE_COGNITO_USER_POOL_ID:-}" >> .env.production
+        - echo "VITE_COGNITO_CLIENT_ID=${VITE_COGNITO_CLIENT_ID:-}" >> .env.production
+        - echo "VITE_AWS_REGION=${VITE_AWS_REGION:-ap-south-1}" >> .env.production
+        - npm run build
+  artifacts:
+    baseDirectory: dist
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*
