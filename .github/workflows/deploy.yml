@@ -1,0 +1,212 @@
+name: Deploy Platform
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      web_origin:
+        description: 'Amplify frontend origin (https://xxx.amplifyapp.com)'
+        required: false
+        default: ''
+      mode:
+        description: 'lite (no VPC) or full (RDS+EFS+VPC)'
+        required: false
+        default: 'lite'
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  STACK_NAME_LITE: ${{ vars.STACK_NAME || 'sclp-api-lite' }}
+  STACK_NAME_FULL: ${{ vars.STACK_NAME_FULL || 'sclp-api' }}
+  NETWORK_STACK: ${{ vars.NETWORK_STACK || 'sclp-network' }}
+  PROJECT_NAME: ${{ vars.PROJECT_NAME || 'sclp' }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy-api:
+    name: Deploy API (CloudFormation / SAM)
+    runs-on: ubuntu-latest
+    outputs:
+      api_url: ${{ steps.outputs.outputs.api_url }}
+      cognito_pool: ${{ steps.outputs.outputs.cognito_pool }}
+      cognito_client: ${{ steps.outputs.outputs.cognito_client }}
+      region: ${{ steps.outputs.outputs.region }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Prefer OIDC if role is set:
+          # role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Setup SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Resolve deploy mode and WebOrigin
+        id: meta
+        run: |
+          MODE="${{ github.event.inputs.mode || 'lite' }}"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          ORIGIN="${{ github.event.inputs.web_origin }}"
+          if [ -z "$ORIGIN" ]; then
+            ORIGIN="${{ vars.WEB_ORIGIN }}"
+          fi
+          if [ -z "$ORIGIN" ]; then
+            ORIGIN="${{ secrets.WEB_ORIGIN }}"
+          fi
+          if [ -z "$ORIGIN" ]; then
+            ORIGIN="https://localhost"
+          fi
+          echo "web_origin=$ORIGIN" >> "$GITHUB_OUTPUT"
+          echo "Using mode=$MODE WebOrigin=$ORIGIN"
+
+      - name: Deploy LITE stack (no VPC)
+        if: steps.meta.outputs.mode == 'lite'
+        run: |
+          sam build --template-file aws/template-lite.yaml
+          sam deploy \
+            --template-file .aws-sam/build/template.yaml \
+            --stack-name "$STACK_NAME_LITE" \
+            --region "$AWS_REGION" \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+            --resolve-s3 \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              "ProjectName=$PROJECT_NAME" \
+              "WebOrigin=${{ steps.meta.outputs.web_origin }}" \
+              "AllowDemoSeed=true"
+
+      - name: Ensure network stack (full mode)
+        if: steps.meta.outputs.mode == 'full'
+        run: |
+          if ! aws cloudformation describe-stacks --stack-name "$NETWORK_STACK" --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "Creating network stack..."
+            aws cloudformation deploy \
+              --template-file aws/network.yaml \
+              --stack-name "$NETWORK_STACK" \
+              --region "$AWS_REGION" \
+              --parameter-overrides "ProjectName=$PROJECT_NAME" \
+              --no-fail-on-empty-changeset
+          else
+            echo "Network stack already exists"
+          fi
+          VPC_ID=$(aws cloudformation describe-stacks --stack-name "$NETWORK_STACK" --query "Stacks[0].Outputs[?OutputKey=='VpcId'].OutputValue" --output text)
+          SUB_A=$(aws cloudformation describe-stacks --stack-name "$NETWORK_STACK" --query "Stacks[0].Outputs[?OutputKey=='PrivateSubnetA'].OutputValue" --output text)
+          SUB_B=$(aws cloudformation describe-stacks --stack-name "$NETWORK_STACK" --query "Stacks[0].Outputs[?OutputKey=='PrivateSubnetB'].OutputValue" --output text)
+          echo "VPC_ID=$VPC_ID" >> "$GITHUB_ENV"
+          echo "PRIVATE_SUBNET_A=$SUB_A" >> "$GITHUB_ENV"
+          echo "PRIVATE_SUBNET_B=$SUB_B" >> "$GITHUB_ENV"
+
+      - name: Deploy FULL stack (RDS + EFS + VPC)
+        if: steps.meta.outputs.mode == 'full'
+        run: |
+          sam build --template-file aws/template.yaml
+          sam deploy \
+            --template-file .aws-sam/build/template.yaml \
+            --stack-name "$STACK_NAME_FULL" \
+            --region "$AWS_REGION" \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+            --resolve-s3 \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              "VpcId=$VPC_ID" \
+              "PrivateSubnetA=$PRIVATE_SUBNET_A" \
+              "PrivateSubnetB=$PRIVATE_SUBNET_B" \
+              "WebOrigin=${{ steps.meta.outputs.web_origin }}" \
+              "DatabaseInstanceClass=db.t4g.micro" \
+              "DatabaseMultiAz=false" \
+              "DatabaseName=secureplatform"
+
+      - name: Export stack outputs
+        id: outputs
+        run: |
+          MODE="${{ steps.meta.outputs.mode }}"
+          if [ "$MODE" = "lite" ]; then
+            STACK="$STACK_NAME_LITE"
+          else
+            STACK="$STACK_NAME_FULL"
+          fi
+          API_URL=$(aws cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint' || OutputKey=='ApiUrl'].OutputValue | [0]" --output text)
+          POOL=$(aws cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='CognitoUserPoolId'].OutputValue" --output text 2>/dev/null || echo "")
+          CLIENT=$(aws cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='CognitoClientId'].OutputValue" --output text 2>/dev/null || echo "")
+          echo "api_url=$API_URL" >> "$GITHUB_OUTPUT"
+          echo "cognito_pool=$POOL" >> "$GITHUB_OUTPUT"
+          echo "cognito_client=$CLIENT" >> "$GITHUB_OUTPUT"
+          echo "region=$AWS_REGION" >> "$GITHUB_OUTPUT"
+          echo "API_URL=$API_URL"
+          echo "COGNITO_POOL=$POOL"
+          echo "COGNITO_CLIENT=$CLIENT"
+
+      - name: Update Amplify env vars (optional)
+        env:
+          APP_ID: ${{ secrets.AMPLIFY_APP_ID }}
+          BRANCH: ${{ secrets.AMPLIFY_BRANCH }}
+          API_URL: ${{ steps.outputs.outputs.api_url }}
+          POOL: ${{ steps.outputs.outputs.cognito_pool }}
+          CLIENT: ${{ steps.outputs.outputs.cognito_client }}
+        run: |
+          if [ -z "$APP_ID" ]; then
+            echo "AMPLIFY_APP_ID secret not set — skip Amplify env update"
+            echo "Set VITE_API_URL=$API_URL manually in Amplify Console, then redeploy."
+            exit 0
+          fi
+          set -e
+          BRANCH_NAME="${BRANCH:-main}"
+          aws amplify update-branch \
+            --app-id "$APP_ID" \
+            --branch-name "$BRANCH_NAME" \
+            --environment-variables \
+              "VITE_API_URL=$API_URL,VITE_AWS_REGION=$AWS_REGION,VITE_COGNITO_USER_POOL_ID=${POOL:-},VITE_COGNITO_CLIENT_ID=${CLIENT:-}" \
+            || true
+          JOB=$(aws amplify start-job --app-id "$APP_ID" --branch-name "$BRANCH_NAME" --job-type RELEASE --query 'jobSummary.jobId' --output text || true)
+          echo "Started Amplify job ${JOB:-none}"
+
+
+  # Frontend is normally built by Amplify Hosting from the same push.
+  # This job is a safety net / alternative static deploy to S3.
+  build-frontend:
+    name: Build frontend artifact
+    runs-on: ubuntu-latest
+    needs: deploy-api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install and build
+        env:
+          VITE_API_URL: ${{ needs.deploy-api.outputs.api_url }}
+          VITE_COGNITO_USER_POOL_ID: ${{ needs.deploy-api.outputs.cognito_pool }}
+          VITE_COGNITO_CLIENT_ID: ${{ needs.deploy-api.outputs.cognito_client }}
+          VITE_AWS_REGION: ${{ needs.deploy-api.outputs.region }}
+        run: |
+          npm ci --legacy-peer-deps
+          echo "VITE_API_URL=$VITE_API_URL" > .env.production
+          echo "VITE_COGNITO_USER_POOL_ID=$VITE_COGNITO_USER_POOL_ID" >> .env.production
+          echo "VITE_COGNITO_CLIENT_ID=$VITE_COGNITO_CLIENT_ID" >> .env.production
+          echo "VITE_AWS_REGION=$VITE_AWS_REGION" >> .env.production
+          npm run build
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist
