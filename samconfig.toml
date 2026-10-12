@@ -1,0 +1,20 @@
+version = 0.1
+
+[default.global.parameters]
+region = "ap-south-1"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = false
+resolve_s3 = true
+stack_name = "sclp-api-lite"
+
+[lite.deploy.parameters]
+stack_name = "sclp-api-lite"
+
+[full.deploy.parameters]
+stack_name = "sclp-api"
