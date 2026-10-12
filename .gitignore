@@ -1,0 +1,22 @@
+node_modules/
+build/
+dist/
+data/
+coverage/
+.DS_Store
+*.log
+__pycache__/
+*.pyc
+.env*
+!.env.example
+
+# Amplify / SAM build
+.amplify/
+.aws-sam/
+dist/
+.env
+.env.local
+.env.production
+data/
+*.log
+.DS_Store
