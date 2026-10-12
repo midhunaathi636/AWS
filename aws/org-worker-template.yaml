@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Organization-owned federated worker resources. The coordinator has no dataset read permission.
+
+Parameters:
+  CoordinatorRoleArn:
+    Type: String
+    Description: Exact IAM role ARN permitted to invoke this organization's launcher.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet::Id
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet::Id
+  WorkerImage:
+    Type: String
+    Description: Image URI in this organization's ECR account built from production_fl/Dockerfile.worker.
+  SuperLinkAddress:
+    Type: String
+    Description: PrivateLink DNS name and port of the authenticated Flower SuperLink.
+  SuperLinkEndpointServiceName:
+    Type: String
+    Description: Service name output by the coordinator stack.
+  SuperLinkCaSecretArn:
+    Type: String
+  NodePrivateKeySecretArn:
+    Type: String
+
+Resources:
+  DataKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: { AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root' }
+            Action: 'kms:*'
+            Resource: '*'
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DataKey.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  RegistryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: pk, AttributeType: S }]
+      KeySchema: [{ AttributeName: pk, KeyType: HASH }]
+      SSESpecification: { SSEEnabled: true }
+  PrivacyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: pk, AttributeType: S }]
+      KeySchema: [{ AttributeName: pk, KeyType: HASH }]
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Outbound-only federated worker identity
+      VpcId: !Ref VpcId
+  FlowerEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Flower PrivateLink endpoint access from the worker only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9092
+          ToPort: 9092
+          SourceSecurityGroupId: !Ref WorkerSecurityGroup
+  FlowerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref VpcId
+      ServiceName: !Ref SuperLinkEndpointServiceName
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref FlowerEndpointSecurityGroup]
+  WorkerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sagemaker.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WorkerOnlyOwnDataAndBudget
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource:
+                  - !Sub '${DataBucket.Arn}/datasets/*'
+                  - !Sub '${DataBucket.Arn}/schemas/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+                Condition:
+                  StringLike: { 's3:prefix': ['datasets/*', 'schemas/*'] }
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub '${DataBucket.Arn}/job-output/*'
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:Encrypt, kms:GenerateDataKey, kms:CreateGrant]
+                Resource: !GetAtt DataKey.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:TransactWriteItems]
+                Resource: !GetAtt PrivacyTable.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref SuperLinkCaSecretArn, !Ref NodePrivateKeySecretArn]
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:GetAuthorizationToken]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:CreateNetworkInterfacePermission
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DeleteNetworkInterfacePermission
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeDhcpOptions
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                Resource: '*'
+  LauncherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: LaunchFixedWorkerOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt RegistryTable.Arn
+              - Effect: Allow
+                Action: [sagemaker:CreateTrainingJob, sagemaker:DescribeTrainingJob, sagemaker:StopTrainingJob]
+                Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/fl-*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt WorkerExecutionRole.Arn
+                Condition:
+                  StringEquals: { iam:PassedToService: sagemaker.amazonaws.com }
+  Launcher:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.12
+      CodeUri: ./
+      Handler: org_launcher.handler
+      Timeout: 30
+      Role: !GetAtt LauncherRole.Arn
+      Environment:
+        Variables:
+          FL_REGISTRY_TABLE: !Ref RegistryTable
+          FL_PRIVACY_TABLE: !Ref PrivacyTable
+          FL_DATA_BUCKET: !Ref DataBucket
+          FL_DATA_KEY_ARN: !GetAtt DataKey.Arn
+          FL_EXECUTION_ROLE_ARN: !GetAtt WorkerExecutionRole.Arn
+          FL_WORKER_IMAGE: !Ref WorkerImage
+          FL_SUPERLINK_ADDRESS: !Ref SuperLinkAddress
+          FL_CA_SECRET_ARN: !Ref SuperLinkCaSecretArn
+          FL_NODE_KEY_SECRET_ARN: !Ref NodePrivateKeySecretArn
+          FL_SUBNET_IDS: !Join [',', [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+          FL_SECURITY_GROUP_IDS: !Ref WorkerSecurityGroup
+  CoordinatorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Launcher
+      Principal: !Ref CoordinatorRoleArn
+
+Outputs:
+  FlowerEndpointId: { Value: !Ref FlowerEndpoint }
+  LauncherArn: { Value: !GetAtt Launcher.Arn }
+  DataBucketName: { Value: !Ref DataBucket }
+  RegistryTableName: { Value: !Ref RegistryTable }
+  PrivacyTableName: { Value: !Ref PrivacyTable }
