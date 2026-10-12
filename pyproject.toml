@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.26,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "secure-collaborative-production-fl"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["flwr==1.39.0", "numpy>=1.26,<3", "boto3>=1.35,<2"]
+
+[project.optional-dependencies]
+coordinator = ["psycopg[binary]>=3.2,<4"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["production_fl", "ml_service"]
+
+[tool.flwr.app]
+publisher = "secure-collaborative-platform"
+fab-format-version = 1
+flwr-version-target = "1.39.0"
+
+[tool.flwr.app.components]
+serverapp = "production_fl.server_app:app"
+clientapp = "production_fl.client_app:app"
+
+[tool.flwr.app.config]
+num-server-rounds = 5
+min-clients = 3
+local-epochs = 1
+learning-rate = 0.1
+noise-multiplier = 4.0
+metric-noise-multiplier = 4.0
+clipping-norm = 1.0
+normalization-count = 10000
+model-clipping-range = 8.0
+round-timeout-seconds = 600.0
+split-seed = 42
+schema-s3-uri = ""

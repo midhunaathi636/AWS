@@ -1,0 +1,8 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY pyproject.toml /app/
+COPY production_fl /app/production_fl
+COPY ml_service /app/ml_service
+RUN pip install --no-cache-dir '.[coordinator]'
+ENV PYTHONUNBUFFERED=1
+ENTRYPOINT ["python", "-m", "production_fl.daemon"]
